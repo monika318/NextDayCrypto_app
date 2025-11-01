@@ -1,0 +1,16 @@
+[project]
+name = "at3-eth-25548660-api"
+version = "0.1.0"
+description = "API for next-day HIGH prediction (Ethereum)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi==0.111.0",
+    "uvicorn==0.30.1",
+    "pandas==2.2.2",
+    "scikit-learn==1.5.1",
+    "numpy==1.26.4",
+    "joblib==1.4.2",
+]
+
+[tool.uvicorn]
+factory = false

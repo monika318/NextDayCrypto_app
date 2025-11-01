@@ -1,0 +1,10 @@
+{
+  "features_list": [
+    "close",
+    "volume",
+    "year",
+    "month",
+    "hour_high",
+    "hour_low"
+  ]
+}
