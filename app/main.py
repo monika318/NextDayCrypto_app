@@ -7,6 +7,9 @@ import numpy as np
 import requests
 import joblib
 import json
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 
 # -------------------------------------------------------------
@@ -14,11 +17,32 @@ from datetime import datetime, timezone
 # -------------------------------------------------------------
 ALLOWED_TOKENS = {"ethereum"}  # ETH only for this student API
 
-MODEL_PATH = "models/ridge_final_on_scaled_features_list_3.pkl"     # your trained model/pipeline
-FEATURES_PATH = "models/feature_names.json"         # optional: exact training feature order
+MODEL_PATH = "models/ridge_final_on_scaled_features_list_3.pkl"  # your trained model/pipeline
+FEATURES_PATH = "models/feature_names.json"                      # optional: exact training feature order
 FEATURE_ORDER_DEFAULT = [
-    "open","close","hour_high","hour_low","marketCap","month","day","hour_open"
+    "open", "close", "hour_high", "hour_low", "marketCap", "month", "day", "hour_open"
 ]
+
+# -------------------------------------------------------------
+# Robust HTTP session (retries/backoff) + simple caches
+# -------------------------------------------------------------
+_session = requests.Session()
+_retry = Retry(
+    total=3,
+    backoff_factor=1.5,  # 0s, 1.5s, 3.0s...
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session.headers.update({"User-Agent": "eth-high-predictor/1.0"})
+
+# Market cap cache (10 min TTL)
+_MC_CACHE = {"usd": None, "ts": 0.0}
+_MC_TTL = 600
+
+# Feature bundle cache (1 min TTL) to throttle upstream calls
+_FEATURES_CACHE = {"data": None, "ts": 0.0}
+_FEATURES_TTL = 60
 
 # -------------------------------------------------------------
 # Load model + feature order
@@ -51,7 +75,7 @@ def kraken_eth_hourly_today() -> pd.DataFrame:
 
     url = "https://api.kraken.com/0/public/OHLC"
     params = {"pair": "ETHUSD", "interval": 60, "since": since_unix}
-    r = requests.get(url, params=params, timeout=30)
+    r = _session.get(url, params=params, timeout=30)
     r.raise_for_status()
     js = r.json()
     if js.get("error"):
@@ -68,10 +92,30 @@ def kraken_eth_hourly_today() -> pd.DataFrame:
     df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
     return df[["time", "open", "high", "low", "close", "volume"]]
 
+def fallback_marketcap_eth_usd() -> float | None:
+    """
+    Fallback provider (CoinCap) if CoinGecko is rate-limited & no cache.
+    """
+    try:
+        r = _session.get("https://api.coincap.io/v2/assets/ethereum", timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        mc = data.get("marketCapUsd")
+        return float(mc) if mc is not None else None
+    except Exception:
+        return None
+
 def coingecko_eth_marketcap_usd() -> float:
     """
-    Fetch current Ethereum market cap in USD from CoinGecko (no auth).
+    Fetch current Ethereum market cap in USD from CoinGecko with retry, cache, and fallback.
+    - Serves cached value if fresh (<= _MC_TTL).
+    - On 429/5xx returns last cached value when available.
+    - If no cache, tries fallback provider before raising.
     """
+    now = time.time()
+    if (now - _MC_CACHE["ts"] <= _MC_TTL) and (_MC_CACHE["usd"] is not None):
+        return _MC_CACHE["usd"]
+
     url = "https://api.coingecko.com/api/v3/coins/ethereum"
     params = {
         "localization": "false",
@@ -81,67 +125,101 @@ def coingecko_eth_marketcap_usd() -> float:
         "developer_data": "false",
         "sparkline": "false",
     }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    mc = js.get("market_data", {}).get("market_cap", {}).get("usd", None)
-    if mc is None:
-        raise RuntimeError("CoinGecko: market cap USD not found")
-    return float(mc)
+
+    r = _session.get(url, params=params, timeout=15)
+
+    # If rate-limited and we have a cache, use it
+    if r.status_code == 429 and _MC_CACHE["usd"] is not None:
+        return _MC_CACHE["usd"]
+
+    try:
+        r.raise_for_status()
+        js = r.json()
+        mc = js.get("market_data", {}).get("market_cap", {}).get("usd", None)
+        if mc is None:
+            # Try fallback or cached value
+            alt = fallback_marketcap_eth_usd()
+            if alt is not None:
+                _MC_CACHE.update({"usd": alt, "ts": now})
+                return alt
+            if _MC_CACHE["usd"] is not None:
+                return _MC_CACHE["usd"]
+            raise RuntimeError("CoinGecko: market cap USD not found")
+        value = float(mc)
+        _MC_CACHE.update({"usd": value, "ts": now})
+        return value
+    except requests.RequestException:
+        # Network/HTTP error: try fallback, else cached, else raise
+        alt = fallback_marketcap_eth_usd()
+        if alt is not None:
+            _MC_CACHE.update({"usd": alt, "ts": now})
+            return alt
+        if _MC_CACHE["usd"] is not None:
+            return _MC_CACHE["usd"]
+        raise
 
 # -------------------------------------------------------------
 # Build fresh feature payload (GET path)
 # -------------------------------------------------------------
 def build_fresh_eth_features_for_today() -> dict:
     """
-    Build the freshest feature payload for the model:
-      - hour_high/hour_low: hours of today's max high / min low (UTC) from Kraken
-      - open: today's first hourly open (UTC)
-      - close: latest hourly close (UTC)
-      - marketCap: current market cap (USD) from CoinGecko
-      - month/day: from current UTC date
-      - hour_open: hour of the first candle today (UTC)
+    Build feature payload with small server-side throttling:
+      - Recompute at most once per minute.
+      - hour_high/hour_low from Kraken
+      - open (first hourly), close (latest hourly)
+      - marketCap from CoinGecko (cached/retried/fallback)
     """
+    now_ts = time.time()
+    if _FEATURES_CACHE["data"] is not None and (now_ts - _FEATURES_CACHE["ts"] <= _FEATURES_TTL):
+        return _FEATURES_CACHE["data"]
+
     hourly = kraken_eth_hourly_today()
-    now = datetime.now(timezone.utc)
-    
+    now_utc = datetime.now(timezone.utc)
+
     defaults = {
         "open": 3000.0,
         "close": 3000.0,
         "hour_high": 12,
         "hour_low": 3,
         "marketCap": coingecko_eth_marketcap_usd(),
-        "month": now.month,
-        "day": now.day,
+        "month": now_utc.month,
+        "day": now_utc.day,
         "hour_open": 0,
     }
 
     if hourly.empty:
+        _FEATURES_CACHE.update({"data": defaults, "ts": now_ts})
         return defaults
 
     idx_high = hourly["high"].idxmax()
-    idx_low  = hourly["low"].idxmin()
+    idx_low = hourly["low"].idxmin()
     hour_high = int(hourly.loc[idx_high, "time"].hour)
-    hour_low  = int(hourly.loc[idx_low,  "time"].hour)
+    hour_low = int(hourly.loc[idx_low, "time"].hour)
 
-    # First hourly 'open' of the UTC day and its hour
     first_row = hourly.iloc[0]
     todays_open = float(first_row["open"])
     hour_open = int(first_row["time"].hour)
 
     latest_close = float(hourly.iloc[-1]["close"])
-    mc = coingecko_eth_marketcap_usd()
 
-    return {
+    try:
+        mc = coingecko_eth_marketcap_usd()
+    except Exception:
+        # Final safety: conservative fallback if everything failed and no cache
+        mc = _MC_CACHE["usd"] if _MC_CACHE["usd"] is not None else 4.0e11
+
+    result = {
         "open": todays_open,
         "close": latest_close,
         "hour_high": hour_high,
         "hour_low": hour_low,
         "marketCap": mc,
-        "month": now.month,
-        "day": now.day,
+        "month": now_utc.month,
+        "day": now_utc.day,
         "hour_open": hour_open,
     }
+    _FEATURES_CACHE.update({"data": result, "ts": now_ts})
+    return result
 
 # -------------------------------------------------------------
 # Feature builder (NO transforms, just exact order)
@@ -151,7 +229,7 @@ def to_model_dataframe(raw: dict) -> pd.DataFrame:
     raw keys required: open, close, hour_high, hour_low, marketCap, month, day, hour_open
     No transforms; order must match training.
     """
-    required = ["open","close","hour_high","hour_low","marketCap","month","day","hour_open"]
+    required = ["open", "close", "hour_high", "hour_low", "marketCap", "month", "day", "hour_open"]
     for k in required:
         if k not in raw:
             raise HTTPException(status_code=400, detail=f"Missing '{k}' in payload.")
@@ -197,7 +275,7 @@ app = FastAPI(
         "['open','close','hour_high','hour_low','marketCap','month','day','hour_open'].\n"
         "Use GET to auto-fetch or POST to supply features explicitly. All times are UTC."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 @app.get("/", tags=["info"])
@@ -224,8 +302,10 @@ def root():
 @app.get("/health/", tags=["info"])
 def health():
     status = model is not None
-    return JSONResponse(status_code=200 if status else 503,
-                        content={"status": "ok" if status else "model_not_loaded"})
+    return JSONResponse(
+        status_code=200 if status else 503,
+        content={"status": "ok" if status else "model_not_loaded"}
+    )
 
 # ---------- GET: auto-fetch ----------
 @app.get("/predict/{token}", tags=["prediction"])
