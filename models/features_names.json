@@ -1,10 +1,23 @@
+// {
+//   "features_list": [
+//     "close",
+//     "volume",
+//     "year",
+//     "month",
+//     "hour_high",
+//     "hour_low"
+//   ]
+// }
 {
   "features_list": [
+    "open",
     "close",
-    "volume",
-    "year",
-    "month",
     "hour_high",
-    "hour_low"
+    "hour_low",
+    "marketCap",
+    "month",
+    "day",
+    "hour_open"
   ]
 }
+// features_list_3 = ["open", "close", "hour_high", "hour_low", "marketCap", "month", "day", "hour_open"]
