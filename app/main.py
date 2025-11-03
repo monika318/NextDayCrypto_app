@@ -10,7 +10,7 @@ import json
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # -------------------------------------------------------------
 # Config
@@ -63,16 +63,26 @@ except Exception:
     print("[WARN] No feature_names.json found; using default order.")
 
 # -------------------------------------------------------------
+# UTC day helpers
+# -------------------------------------------------------------
+def utc_midnight(dt: datetime) -> datetime:
+    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+def utc_today_midnight() -> datetime:
+    return utc_midnight(datetime.now(timezone.utc))
+
+def utc_yesterday_midnight() -> datetime:
+    return utc_today_midnight() - timedelta(days=1)
+
+# -------------------------------------------------------------
 # Public data fetchers (no keys)
 # -------------------------------------------------------------
-def kraken_eth_hourly_today() -> pd.DataFrame:
+def kraken_eth_hourly_since(since_dt_utc: datetime) -> pd.DataFrame:
     """
-    Pull today's (UTC) ETH/USD 60-min candles from Kraken.
+    Pull ETH/USD 60-min candles from Kraken since 'since_dt_utc'.
     Returns columns: time, open, high, low, close, volume
     """
-    today_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    since_unix = int(today_utc.timestamp())
-
+    since_unix = int(since_dt_utc.timestamp())
     url = "https://api.kraken.com/0/public/OHLC"
     params = {"pair": "ETHUSD", "interval": 60, "since": since_unix}
     r = _session.get(url, params=params, timeout=30)
@@ -159,22 +169,26 @@ def coingecko_eth_marketcap_usd() -> float:
         raise
 
 # -------------------------------------------------------------
-# Build fresh feature payload (GET path)
+# Build features for the LATEST COMPLETED UTC DAY (D)
 # -------------------------------------------------------------
-def build_fresh_eth_features_for_today() -> dict:
+def build_eth_features_for_completed_day():
     """
-    Build feature payload with small server-side throttling:
-      - Recompute at most once per minute.
-      - hour_high/hour_low from Kraken
-      - open (first hourly), close (latest hourly)
-      - marketCap from CoinGecko (cached/retried/fallback)
+    Uses the last fully completed UTC day (yesterday 00:00..today 00:00) as D.
+    Returns: (features_dict, feature_day_start_utc[D], prediction_day_start_utc[D+1])
     """
+    # Serve cached bundle if fresh
     now_ts = time.time()
-    if _FEATURES_CACHE["data"] is not None and (now_ts - _FEATURES_CACHE["ts"] <= _FEATURES_TTL):
-        return _FEATURES_CACHE["data"]
+    cache = _FEATURES_CACHE
+    if cache["data"] is not None and (now_ts - cache["ts"] <= _FEATURES_TTL):
+        day_start = cache["data"]["__meta"]["feature_day_start_utc"]
+        return {k: v for k, v in cache["data"].items() if k != "__meta__"}, day_start, day_start + timedelta(days=1)
 
-    hourly = kraken_eth_hourly_today()
-    now_utc = datetime.now(timezone.utc)
+    day_start = utc_yesterday_midnight()
+    day_end = utc_today_midnight()
+
+    # Pull from Kraken and filter to the exact window [D, D+1)
+    hourly_all = kraken_eth_hourly_since(day_start)
+    hourly = hourly_all[(hourly_all["time"] >= day_start) & (hourly_all["time"] < day_end)].copy()
 
     defaults = {
         "open": 3000.0,
@@ -182,14 +196,15 @@ def build_fresh_eth_features_for_today() -> dict:
         "hour_high": 12,
         "hour_low": 3,
         "marketCap": coingecko_eth_marketcap_usd(),
-        "month": now_utc.month,
-        "day": now_utc.day,
+        "month": day_start.month,
+        "day": day_start.day,
         "hour_open": 0,
     }
 
     if hourly.empty:
-        _FEATURES_CACHE.update({"data": defaults, "ts": now_ts})
-        return defaults
+        bundle = {**defaults, "__meta__": {"feature_day_start_utc": day_start}}
+        _FEATURES_CACHE.update({"data": bundle, "ts": now_ts})
+        return defaults, day_start, day_start + timedelta(days=1)
 
     idx_high = hourly["high"].idxmax()
     idx_low = hourly["low"].idxmin()
@@ -205,7 +220,6 @@ def build_fresh_eth_features_for_today() -> dict:
     try:
         mc = coingecko_eth_marketcap_usd()
     except Exception:
-        # Final safety: conservative fallback if everything failed and no cache
         mc = _MC_CACHE["usd"] if _MC_CACHE["usd"] is not None else 4.0e11
 
     result = {
@@ -214,12 +228,13 @@ def build_fresh_eth_features_for_today() -> dict:
         "hour_high": hour_high,
         "hour_low": hour_low,
         "marketCap": mc,
-        "month": now_utc.month,
-        "day": now_utc.day,
+        "month": day_start.month,
+        "day": day_start.day,
         "hour_open": hour_open,
+        "__meta__": {"feature_day_start_utc": day_start},
     }
     _FEATURES_CACHE.update({"data": result, "ts": now_ts})
-    return result
+    return {k: v for k, v in result.items() if k != "__meta__"}, day_start, day_start + timedelta(days=1)
 
 # -------------------------------------------------------------
 # Feature builder (NO transforms, just exact order)
@@ -271,11 +286,11 @@ class EthInput(BaseModel):
 app = FastAPI(
     title="AT3 – Next-Day HIGH Predictor (Ethereum API)",
     description=(
-        "Predicts next-day HIGH (t+1) for ETH using features: "
-        "['open','close','hour_high','hour_low','marketCap','month','day','hour_open'].\n"
-        "Use GET to auto-fetch or POST to supply features explicitly. All times are UTC."
+        "Predicts next-day HIGH (t+1) for ETH using features from the latest COMPLETED UTC day (D).\n"
+        "GET builds features for D (yesterday UTC) and predicts for D+1. POST accepts features for a given day D and predicts for D+1.\n"
+        "All times are UTC to avoid leakage."
     ),
-    version="1.3.0",
+    version="1.5.0",
 )
 
 @app.get("/", tags=["info"])
@@ -287,8 +302,8 @@ def root():
         "endpoints": {
             "/": "GET – project info",
             "/health/": "GET – service healthcheck",
-            "/predict/{token}": "GET – auto-fetch features & predict",
-            "/predict/{token} (POST)": "POST – provide features & predict",
+            "/predict/{token}": "GET – auto-fetch features for latest completed UTC day & predict next day",
+            "/predict/{token} (POST)": "POST – provide features (for day D) & predicts for day D+1",
         },
         "feature_order_used": FEATURE_ORDER if FEATURE_ORDER else FEATURE_ORDER_DEFAULT,
         "model_artifacts": {"model_path": MODEL_PATH, "feature_order_file": FEATURES_PATH},
@@ -296,7 +311,7 @@ def root():
             "open": 3400.56, "close": 3432.11, "hour_high": 15, "hour_low": 3,
             "marketCap": 4.2e11, "month": 11, "day": 1, "hour_open": 0
         },
-        "note": "Ensure your trained model was fit with exactly these 8 features in this exact order (UTC-based).",
+        "note": "GET always uses the last completed UTC day (D) and predicts for D+1.",
     }
 
 @app.get("/health/", tags=["info"])
@@ -307,7 +322,7 @@ def health():
         content={"status": "ok" if status else "model_not_loaded"}
     )
 
-# ---------- GET: auto-fetch ----------
+# ---------- GET: ALWAYS use latest completed day D, predict D+1 ----------
 @app.get("/predict/{token}", tags=["prediction"])
 def predict_get(token: str = Path(..., description="Must be 'ethereum'")):
     if token.lower() not in ALLOWED_TOKENS:
@@ -316,7 +331,7 @@ def predict_get(token: str = Path(..., description="Must be 'ethereum'")):
         raise HTTPException(status_code=503, detail="Model is not loaded on the server.")
 
     try:
-        raw = build_fresh_eth_features_for_today()
+        raw, feature_day_start, predict_day_start = build_eth_features_for_completed_day()
         X = to_model_dataframe(raw)
         yhat = float(model.predict(X)[0])
     except requests.HTTPError as e:
@@ -328,13 +343,15 @@ def predict_get(token: str = Path(..., description="Must be 'ethereum'")):
         "token": token.lower(),
         "predicted_next_day_high": yhat,
         "units": "USD",
+        "feature_day_utc": feature_day_start.date().isoformat(),          # D
+        "prediction_for_day_utc": (predict_day_start.date().isoformat()), # D+1
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "features_used": raw,  # raw values fed to model
+        "features_used": raw,
         "n_features": int(X.shape[1]),
         "feature_order_used": list(X.columns),
     }
 
-# ---------- POST: user-supplied features ----------
+# ---------- POST: user-supplied features for day D -> predict D+1 ----------
 @app.post("/predict/{token}", tags=["prediction"])
 def predict_post(payload: EthInput, token: str = Path(..., description="Must be 'ethereum'")):
     if token.lower() not in ALLOWED_TOKENS:
@@ -349,10 +366,23 @@ def predict_post(payload: EthInput, token: str = Path(..., description="Must be 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
+    # Infer feature day D from (month, day) using current UTC year (best effort)
+    year_utc = datetime.now(timezone.utc).year
+    try:
+        feature_day = datetime(year_utc, int(raw["month"]), int(raw["day"]), tzinfo=timezone.utc)
+        predict_day = feature_day + timedelta(days=1)
+        feature_day_iso = feature_day.date().isoformat()
+        predict_day_iso = predict_day.date().isoformat()
+    except Exception:
+        feature_day_iso = None
+        predict_day_iso = None
+
     return {
         "token": token.lower(),
         "predicted_next_day_high": yhat,
         "units": "USD",
+        "feature_day_utc": feature_day_iso,          # D
+        "prediction_for_day_utc": predict_day_iso,   # D+1
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "features_used": raw,
         "n_features": int(X.shape[1]),
