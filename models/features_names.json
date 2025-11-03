@@ -1,23 +1,21 @@
+
 // {
 //   "features_list": [
+//     "open",
 //     "close",
-//     "volume",
-//     "year",
-//     "month",
 //     "hour_high",
-//     "hour_low"
+//     "hour_low",
+//     "marketCap",
+//     "month",
+//     "day",
+//     "hour_open"
 //   ]
 // }
-{
-  "features_list": [
-    "open",
-    "close",
-    "hour_high",
-    "hour_low",
-    "marketCap",
-    "month",
-    "day",
-    "hour_open"
-  ]
-}
-// features_list_3 = ["open", "close", "hour_high", "hour_low", "marketCap", "month", "day", "hour_open"]
+[
+  "close", "low", "volume",
+  "close_lag_1", "volume_lag_1",
+  "roll_mean_close_7", "roll_std_close_7",
+  "return_1d", "price_range", "body_size",
+  "month_sin", "month_cos", "hour_high_sin", "hour_high_cos",
+  "atr_14"
+]
