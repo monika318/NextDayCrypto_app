@@ -52,3 +52,20 @@ FastAPI service that predicts **tomorrow’s HIGH** for **Ethereum (ETH-USD)** u
 **Install dependencies:**
 ```bash
 pip install --no-cache-dir -r requirements.txt
+```
+**Run the server**
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+## Open in browser:
+
+- **Docs (Swagger)**: http://127.0.0.1:8000/docs
+
+- **Health**: http://127.0.0.1:8000/health/
+
+- **Predict**: http://127.0.0.1:8000/predict/ethereum
+
+
+
+
